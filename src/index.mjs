@@ -1287,7 +1287,10 @@ export default {
         if (!session) return next()
         let preset
         try {
-          preset = permissionPresets.currents(session)
+          // DSH v0.1.5-rc2：permissionPresets.current(session) 返回会话当前预设名
+          // （'auto-approve' / 'workspace-write' / 'danger-full-access' / 'custom'）；
+          // 旧版曾用 current(session.events)，无 currents 方法（issue#15 的错改来源）。
+          preset = permissionPresets.current(session)
         } catch (error) {
           console.error(`[${NAME}] permissionPresets.current failed`, error)
           return next()

@@ -50,7 +50,8 @@ dsh plugin --profile web add dsh-approval-gate
 进入你的dsh根目录
 ```sh
 
-dsh plugin --profddile web add dsh-approval-gate
+pnpm dsh plugin --profile web add /your/abs/path/to/dsh-approval-gate
+
 
 ```
 
