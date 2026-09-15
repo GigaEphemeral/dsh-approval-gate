@@ -3,3 +3,8 @@ node_modules/
 .DS_Store
 vision.env
 .dsh-vision.env
+.npm-cache/
+dsh-approval-gate-0.5.2.tgz
+package-lock.json
+pnpm-lock.yaml
+
