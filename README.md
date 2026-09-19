@@ -6,6 +6,19 @@
 
 Flash 模型预判每次沙箱越界：常规操作自动放行，硬风险操作（删除 / 凭据 / 远程 / 系统 / 批量）永远转人工确认；学习沉淀只针对你确认过的操作，并提供界面化人工审查入口。
 
+
+## Fork说明
+
+- 原作者好像没有在维护了, 遇到一些 dsh 0.1.15-rc2 环境的使用问题; 该项目进行修复, 但是不发布新的包
+- 开发者使用, 见下方 从源码安装 章节
+- 注意! 使用需要进行手动配置
+- 欢迎提交MR, 我会进行合并, 但是issue的话, 可能没时间排查
+
+## todo
+
+- 1.原作没有写 完整的功能性自动执行测试用例 和 风险控制用例,需要进行补充
+- 2.整理功能列表进行维护
+
 ## ✨ 特性
 
 - ⚡ **Flash 风险预判**：每次沙箱越界由 Flash 模型判定（`SAFE` / `RISKY:<类别>`），可回补操作自动放行
@@ -60,6 +73,73 @@ pnpm dsh plugin --profile web add /your/abs/path/to/dsh-approval-gate
 1. **配置权限预设**：在 `~/.dsh/profiles/web/cordis.patch.yml` 添加 `auto-approve` 预设（[详见指南](docs/GUIDE.md#%E5%AE%89%E8%A3%85%E5%90%8E%E5%BF%85%E9%A1%BB%E6%89%8B%E5%8A%A8%E9%85%8D%E7%BD%AE%E6%9D%83%E9%99%90%E9%A2%84%E8%AE%BE%E5%85%B3%E9%94%AE%E6%AD%A5%E9%AA%A4)）
 2. **重启** `dsh web`
 3. **选择预设**：会话权限下拉选中「自动审批（Flash）」
+
+## ⚙️ 手动配置（安装后必须做的两件事）
+
+插件需要**两处手动配置**才能生效。以下均为**相对路径**：标注「相对 DSH 根目录」的指 `DSH_HOME`（通常 `~/.dsh`），标注「相对插件仓库根目录」的指本插件源码目录。
+
+### ① 把插件注册进 profile
+
+可以改用命令：`dsh plugin --profile <profile> add dsh-approval-gate`
+
+也可以手动修改
+
+修改 **`profiles/<profile>/package.json`**（相对 DSH 根目录；`<profile>` 通常为 `web`）：
+- `dependencies` 加一行（源码 `link:` 安装，值为插件仓库的**绝对路径**）：
+  ```json
+  "dsh-approval-gate": "link:<插件仓库绝对路径>"
+  ```
+- `dsh.profile.bundles` 数组里加一项：`"dsh-approval-gate"`
+
+### ② 配置 auto-approve 权限预设
+
+修改 **`profiles/<profile>/cordis.patch.yml`**（相对 DSH 根目录），追加下面这段**顶层 id-targeted patch**（不要用 `- insert:`）：
+
+```yaml
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+      auto-approve:
+        sandbox: workspace-write
+        approval: ask
+        name: 自动审批（Flash）
+        description: 多级判定：工作区写入自动放行，危险操作转人工审批。
+```
+
+⚠️ **不要**把这个 `permission` 预设写进插件仓库里的 **`cordis.patch.yml`**（相对插件仓库根目录）——基础 bundle（`@deepseek-ai/dsh-base`）已注册同名 `permission` 行，再用 `- insert:` 插入会冲突，导致启动崩溃（`permission2` 重复服务注册）。插件仓库的 `cordis.patch.yml` 只负责插入插件自身行，保持默认即可。
+
+### ③ 重启并选择预设
+
+1. 重启 `dsh web`
+2. 会话权限下拉选择「自动审批（Flash）」
+
+### Flash 判定用哪个模型？
+
+插件**不硬编码 provider/model**：flash 判定跟随会话当前选用的模型（读取 `agentDefaultModel` 的当前选择，动态获取）。仅当该服务不可用时才回退到内置默认（`deepseek-official / deepseek-v4-flash`），属 fail-safe 兜底。若你的模型不支持 `reasoningEffort: 'off'` 档位，插件会自动省略该字段、按模型默认档位执行，无需手动配置。
+
+## 🧪 测试
+
+一条命令自动执行全部检查（`npm test`）：
+
+| 层 | 命令 | 覆盖内容 |
+|---|---|---|
+| 语法 | `node --check src/index.mjs`、`node --check client.js` | 宿主插件与浏览器端 bundle 语法 |
+| 功能+风险用例 | `node .ag-test/isolated-test.mjs` | 21 个用例：权限预设门控、flash SAFE 放行、硬风险类别（deletion 等）转人工、DENY 危险词、白名单、中立确认计数、学习沉淀/指纹、同类验证（SAME/DIFFERENT）、`reasoningEffort: 'off'` 兼容（模型不支持时省略）、**防误放行回归**（正文含 SAFE/RISKY/SAME 反例一律不得自动放行）、思考文本不污染结论 |
+| loader 合成树 | `node .ag-test/verify-loader-tree.mjs` | 校验 profile 各 bundle 层 + 用户层**无重复 insert id**（启动崩溃 `permission2` 的回归检查），并确认 `permission` / `dsh-approval-gate` 各只 insert 一次 |
+
+- 功能/风险用例**完全隔离**：独立 Node 进程 + 临时数据目录 + 桩 llm/webServer，不触碰主进程、不绑定端口、不发真实模型请求。
+- 没有安装 DSH 运行时（找不到 `<DSH_HOME>/profiles/node_modules`）或指定 profile 不存在时，相关用例**自动 SKIP 并以 0 退出**，不影响裸克隆/CI。
+- loader 校验默认检查 `profiles/web`（相对 DSH_HOME），可用 `--profile <目录>` 指定其他 profile。
 
 ## 📖 文档
 

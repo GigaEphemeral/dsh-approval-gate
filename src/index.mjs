@@ -1112,30 +1112,70 @@ export default {
     /**
      * 底层 flash 调用：流式请求并累积文本输出（可取消）。
      * 由 judgeOnce / verifySimilarity 共用；异常向上抛，由 withRetry 决定重试或降级。
-     * @returns {Promise<string>} 模型原始输出文本
+     * @returns {Promise<string>} 模型原始输出文本（仅 text-delta；思考文本不混入，防污染 SAFE/RISKY 解析）
      */
+    // provider/model → 是否支持 reasoningEffort 'off'（缓存，避免每次审批都查一次适配器）
+    const reasoningOffCache = new Map()
+    const supportsReasoningOff = async (provider, model, signal) => {
+      const key = `${provider}/${model}`
+      if (reasoningOffCache.has(key)) return reasoningOffCache.get(key)
+      let supported = false
+      try {
+        if (llm && typeof llm.resolveModelInfo === 'function') {
+          const info = await llm.resolveModelInfo(provider, model, signal)
+          const efforts = info && info.reasoning && Array.isArray(info.reasoning.efforts) ? info.reasoning.efforts : []
+          supported = efforts.some((e) => e && e.id === 'off')
+        }
+      } catch (error) {
+        // 解析失败按「不支持 off」处理：省略该字段即可，绝不因它让整个审批失败
+        console.warn(`[${NAME}] resolveModelInfo 失败，flash 请求省略 reasoningEffort`, error)
+        supported = false
+      }
+      reasoningOffCache.set(key, supported)
+      return supported
+    }
     const callFlash = async (userText, systemPrompt, signal) => {
       const { provider, model } = resolveModel()
       let text = ''
+      // 仅当模型声明支持 reasoningEffort 'off' 才发送：第三方 provider（如 huoshan-186 的
+      // DeepSeek-V4-Flash）不支持该档位，硬传会被 llm 运行时拒绝（UNSUPPORTED_REASONING_EFFORT），
+      // 导致审批每次都失败；不支持时省略，让模型用默认档位（思考文本已不计入答案，解析不受影响）。
+      const reasoningEffort = (await supportsReasoningOff(provider, model, signal)) ? 'off' : undefined
       for await (const chunk of llm.stream({
         provider,
         model,
         messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
         system: systemPrompt,
         temperature: 0,
-        reasoningEffort: 'off',
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
         // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
         maxTokens: 256,
         signal
       })) {
+        // reasoning-delta 不计入答案文本：模型带思考时，思考内容混入会污染 SAFE/RISKY 解析
         if (chunk.type === 'text-delta') text += chunk.text
-        else if (chunk.type === 'reasoning-delta') text += chunk.text
         else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
           const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
           throw new Error('flash 调用失败: ' + failure)
         }
       }
       return text
+    }
+
+    /**
+     * 从模型输出中提取「末尾判定词」：只认出现在文本末尾（后面只允许空白/标点）的判定词。
+     * 防误放行的关键防线：若用 includes() 匹配，模型正文里出现“该操作并不 SAFE”“有 RISKY 风险”
+     * 这类反例措辞会被误判成 SAFE/RISKY，直接导致误自动放行；只认末尾结论则不会有此误判。
+     * 提取不到返回 null（调用方按 fail-safe 处理：转人工，绝不自动放行）。
+     * @param {string} text 模型原始输出
+     * @param {string[]} patterns 判定词正则片段（交替项，如 ['SAFE', 'RISKY\\s*[:：]\\s*[A-Z_]+']）
+     * @returns {string|null} 命中的判定词（大写），否则 null
+     */
+    const trailingVerdict = (text, patterns) => {
+      const t = String(text || '').trim()
+      if (!t) return null
+      const m = t.match(new RegExp(`(${patterns.join('|')})[\\s.。！!…]*$`, 'i'))
+      return m ? m[1].toUpperCase() : null
     }
 
     /**
@@ -1151,15 +1191,16 @@ export default {
         '请判断：执行该操作是否会造成无法回补的后果或触碰敏感资源？输出 SAFE 或 RISKY:<类别>。'
       ].join('\n')
       const text = await callFlash(user, SYSTEM_PROMPT, signal)
-      const trimmed = text.trim().toUpperCase()
-      const riskyMatch = trimmed.match(/RISKY\s*[:：]\s*([A-Z_]+)/)
-      if (riskyMatch) {
-        const category = riskyMatch[1].toLowerCase()
-        return { verdict: 'risky', category }
+      // 只认末尾判定词（见 trailingVerdict）；不匹配 → 判定不可靠，走 fail-safe 转人工
+      const verdict = trailingVerdict(text, ['RISKY\\s*[:：]\\s*[A-Z_]+', 'SAFE'])
+      if (verdict) {
+        if (verdict.startsWith('RISKY')) {
+          // 裸 RISKY（无类别，旧协议残留）→ 按中立处理（有计数/裁决兜底）
+          const category = (verdict.split(/[:：]/)[1] || 'neutral').toLowerCase()
+          return { verdict: 'risky', category }
+        }
+        return { verdict: 'safe' }
       }
-      // 裸 RISKY（无类别，旧协议残留）→ 按中立处理（有计数/裁决兜底）
-      if (trimmed.includes('RISKY')) return { verdict: 'risky', category: 'neutral' }
-      if (trimmed.includes('SAFE')) return { verdict: 'safe' }
       // 模型表达不确定/无法判断（而非复述 prompt）→ 按中立处理（走确认制，fail-safe）
       if (/无法判断|无法确定|不确定|不能确定|无法评估|UNCERTAIN|CANNOT (JUDGE|DETERMINE|ASSESS)/i.test(text)) {
         return { verdict: 'risky', category: 'neutral' }
@@ -1203,9 +1244,10 @@ export default {
         '请判断：新操作是否与某个已批准样本属于同类操作？输出 SAME 或 DIFFERENT。'
       ].join('\n')
       const text = await callFlash(user, SIMILARITY_PROMPT, signal)
-      const trimmed = text.trim().toUpperCase()
-      if (trimmed.includes('DIFFERENT')) return { verdict: 'different' }
-      if (trimmed.includes('SAME')) return { verdict: 'same' }
+      // 只认末尾判定词（见 trailingVerdict），防止正文提到 SAME/DIFFERENT 字样时误判
+      const verdict = trailingVerdict(text, ['DIFFERENT', 'SAME'])
+      if (verdict === 'DIFFERENT') return { verdict: 'different' }
+      if (verdict === 'SAME') return { verdict: 'same' }
       // 无法判断 → 按 different（fail-safe：验证不了就人工）
       if (/无法判断|不确定|无法确定|UNCERTAIN/i.test(text)) return { verdict: 'different' }
       throw new Error('同类验证输出无法解析: ' + JSON.stringify(text.slice(0, 120)))

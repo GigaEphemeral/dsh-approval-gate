@@ -7,4 +7,5 @@ vision.env
 dsh-approval-gate-0.5.2.tgz
 package-lock.json
 pnpm-lock.yaml
+.idea/
 
